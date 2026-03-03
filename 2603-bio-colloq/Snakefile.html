@@ -1,0 +1,1429 @@
+<html>
+<head>
+  <style>
+    pre { font-size: 25px; }
+  </style>
+<body>
+<pre>
+from os.path import abspath, basename, dirname, join, splitext
+
+shell.prefix("set -euo pipefail; set -x; sleep 10;")
+
+BASE = os.getcwd()
+BIO = os.environ["BIO"]
+RUN = os.environ.get("RUN", "main")
+WRK = join(BASE, "tmp", "wrk", RUN)
+MTR = join(BASE, "tmp", "mtr", RUN) # metrics
+
+def bio(*path):
+    return os.path.join(BIO, *path)
+
+def mtr(*path):
+    return os.path.join(MTR, *path)
+
+def wrk(*path):
+    return os.path.join(WRK, *path)
+
+#-----------------------------------------------------------------------------------------------------
+# containers
+#-----------------------------------------------------------------------------------------------------
+
+CONTAINER_CMD = "bio-img"
+
+IMG_HDS = bio("img", "prd", "gen", "statgen-hds-util", "5c3b611.simg")
+IMG_HTS = bio("img", "prd", "gen", "htslib", "1.21.simg")
+IMG_KING = bio("img", "prd", "gen", "king", "227.simg")
+IMG_PICARD = bio("img", "prd", "gen", "picard", "2.26.11.simg")
+IMG_PLINK19 = bio("img", "prd", "gen", "plink19", "20210606.simg")
+IMG_PLINK20 = bio("img", "prd", "gen", "plink20", "20211217.simg")
+IMG_PYTHON = bio("img", "prd", "gen", "python3", "3.11.2.simg")
+IMG_RUTH = bio("img", "prd", "gen", "statgen-ruth", "a950b06.simg")
+IMG_SNPSIFT = bio("img", "prd", "gen", "snpsift", "2022-02-6ca56a6.simg")
+IMG_XWAS = bio("img", "prd", "fac", "parikhh", "teddy-gwas-qc", "2020-01.simg")
+
+BCFTOOLS = " ".join([CONTAINER_CMD, IMG_HTS, "bcftools"])
+BGZIP = " ".join([CONTAINER_CMD, IMG_HTS, "bgzip"])
+HDS_UTIL = " ".join([CONTAINER_CMD, IMG_HDS, "hds-util"])
+KING = " ".join([CONTAINER_CMD, IMG_KING, "king"])
+PICARD = " ".join([CONTAINER_CMD, IMG_PICARD, "java -jar /usr/local/bin/picard.jar"])
+PLINK19 = " ".join([CONTAINER_CMD, IMG_PLINK19, "plink"])
+PLINK20 = " ".join([CONTAINER_CMD, IMG_PLINK20, "plink2"])
+PYTHON = " ".join([CONTAINER_CMD, IMG_PYTHON, "/usr/local/bin/python3"])
+RUTH = " ".join([CONTAINER_CMD, IMG_RUTH, "ruth"])
+SNPSIFT = " ".join([CONTAINER_CMD, IMG_SNPSIFT, "java", "${JAVA_OPTS:-}", "-jar", "/snpEff/SnpSift.jar"])
+XWAS = " ".join([CONTAINER_CMD, IMG_XWAS, "/bin/bash -x /xwas-3.0/bin/run_QC.sh"])
+
+#=====================================================================================================
+# Global Variables
+#=====================================================================================================
+
+R2_VALUE = {
+    "immun": "0.8",
+    "exome": "0.5",
+    "merge": "0.5",
+}
+
+CHROMOSOMES = [f"chr{n}" for n in range(1, 23)] + ["chrX"]
+
+SUBJECTS = [
+    "all",
+    "eur"
+]
+
+HWE = {
+    "all": {
+        "common": "1e-10",
+        "hla_pre": "1e-10",
+        "hla": "1e-20",
+        "hla_post": "1e-10",
+        "sex": "1e-6",
+    },
+    "eur": {
+        "common": "1e-6",
+        "hla_pre": "1e-6",
+        "hla": "1e-20",
+        "hla_post": "1e-6",
+        "sex": "1e-4",
+    }
+}
+
+HLA_GRCH38_START = "28510120" # HLA GRCh38 - https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC - chr6:28510120-33480577
+HLA_GRCH38_END = "33480577" # HLA GRCh38 - https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC - chr6:28510120-33480577
+
+#=====================================================================================================
+# Helper functions
+#=====================================================================================================
+
+def remove_from_list(l, items):
+    return [x for x in l if x not in items]
+
+#=====================================================================================================
+# Pipeline Variables defined/overridden by RUN
+#=====================================================================================================
+
+WGS_VCF_DIR = bio("lab", "teddy-ncc2", "um", "tdy-wgs-ncc2-geno-topmed-2505", "phased")
+
+FAM_ORIG = {
+    "immunochip":   bio("lab", "teddy", "uva-hii", "GWAS-6", "mask", "MICH", "immuno", "children_parents_immunochip.hg38.fam"),
+    "t1dexomechip": bio("lab", "teddy", "uva-hii", "GWAS-6", "mask", "MICH", "exome", "children_parents_t1dexome.hg38.fam"),
+}
+
+TEDDY_CHILDREN = bio("mta", "tdy", "dataset", "teddy-children.tsv")
+
+MASK_DB = bio("mta", "tdy", "masks", "MICH.csv")
+
+EUR_CONTROLS = join(BASE, "metadata/mask/MICH/ImmunoChip_T1DExomeChip_european_controls_unrelated_wo_admixture.tsv")
+  # IID                 Ancestry    Outcome   Relatedness
+  # MICH591925488080    European    0         unrelated
+  # MICH437300849810    European    0         unrelated
+
+DBSNP_VCF_GRCH38 = bio("ref", "ncbi", "snp", "archive", "b155", "VCF", "GCF_000001405.39.gz")
+
+DBSNP_VCF_MAP_GRCH38 = join(BASE, "metadata", "GCF_000001405.39.tsv")
+
+QC_CHIP = "merge"
+
+CHIPS = ["immun", "exome", "merge"]
+
+CONCORDANCE_THRESHOLD = os.environ.get("CONCORDANCE_THRESHOLD", "0.975")
+
+TEST_REGIONS = ""
+
+PCA_DIR = bio("lab", "teddy", "uva-hii", "GWAS-4", "input", "documents")
+
+PCA_IMMUN = join(PCA_DIR, "ImmunoChip", "pca_analysis", "children_parents_immunochip_pc.txt")
+
+PCA_EXOME = join(PCA_DIR, "Parents_T1DExomeChip", "pca_analysis", "children_parents_t1dexome_pc.txt")
+
+PCA_IMMUN_FAM = join(PCA_DIR, "ImmunoChip", "pca_analysis", "children_parents_immunochippca_input.fam")
+
+PCA_EXOME_FAM = join(PCA_DIR, "Parents_T1DExomeChip", "pca_analysis", "children_parents_t1dexomepca_input.fam")
+
+INPUT_COMBINED = {
+    "immun": bio("hld", "tdy-gwas-imp-cmb-2509", "immun"),
+    "exome": bio("hld", "tdy-gwas-imp-cmb-2509", "exome"),
+    "merge": bio("hld", "tdy-gwas-imp-cmb-2509", "merge"),
+}
+
+if RUN.startswith("test"):
+    CHROMOSOMES = ["chr21", "chr22", "chrX"]
+    TEST_REGIONS = join(BASE, "metadata", "test_regions.tsv")
+
+elif RUN.startswith("main"):
+    pass
+
+elif RUN == "dag":
+    CHROMOSOMES = ["chr22"]
+
+elif RUN == "dag-chrX":
+    CHROMOSOMES = ["chr22", "chrX"]
+
+else:
+    print(f"Run '{RUN}' not defined in Snakefile. Exiting.", file=sys.stderr)
+    sys.exit(1)
+
+if os.environ.get("CHROMOSOMES"):
+    CHROMOSOMES = os.environ["CHROMOSOMES"].split(",")
+
+if os.environ.get("ME_THRESHOLD"):
+    ME_THRESHOLD = os.environ["ME_THRESHOLD"]
+else:
+    ME_THRESHOLD = "0.01"
+
+BCFTOOLS_FILL_TAGS = "AF,AC,AC_Hemi,AC_Hom,AC_Het,AN,ExcHet,HWE,MAF,NS"
+
+
+#=====================================================================================================
+# Driving Rules - prefix with target_ (e.g. target_<name>)
+#=====================================================================================================
+
+rule target_all:
+    input:
+        expand(wrk("result/{mask}/{population}.vcf.gz"), mask=["MICH", "NONE"], population=["all", "cohort"]),
+        expand(wrk("result_hds/{mask}/{chip}.vcf.gz"), mask=["MICH", "NONE"], chip=CHIPS)
+
+rule target_by_chr:
+    """
+    This rule excludes concatenation and unmasking for quicker turn-around of results. Once this rule is run,
+    you can obtain the concatenated files and the unmasked version of the files by running target_tall.
+    """
+    input:
+        expand(wrk("result/MICH/{population}/{chr}.vcf.gz"), population=["all", "cohort"], chr=CHROMOSOMES)
+
+rule target_filter_keep:
+    input:
+        expand(wrk("filter_keep/merge/both/{chr}.vcf.gz"), chr=CHROMOSOMES),
+        expand(wrk("filter_keep/merge/{sex}/chrX.vcf.gz"), sex=["female", "male"])
+
+rule target_cc_snpsift_exclude_hla:
+    input:
+        expand(wrk("cc_snpsift_exclude_hla/{threshold}.txt"),
+            threshold=["0.00", "0.50", "0.60", "0.70", "0.80", "0.85", "0.90", "0.95", "0.975", "0.99", "1.00"])
+
+rule target_cc_filter_ruth_post_filter:
+    input:
+        expand(wrk("cc_filter_ruth_post_filter/{chr}.bcf"), chr=CHROMOSOMES)
+
+rule target_mendel_keep:
+    input:
+        expand(wrk("mendel_keep/{me}/{chr}.keep.txt"),
+               me=["0.001", "0.01", "0.05", "0.15", "0.25", "0.50", "0.75"], chr=CHROMOSOMES)
+
+rule target_filter_r2:
+    input:
+        expand(wrk("filter_r2/{chip}/{chr}.bcf"), chip=CHIPS, chr=CHROMOSOMES)
+
+rule target_king:
+    input:
+        expand(wrk("king/merge/{chr}.bcf"), chr=CHROMOSOMES)
+
+#=====================================================================================================
+# Rules
+#=====================================================================================================
+
+localrules:
+    cc_filter_ruth_samples,
+    cc_samples_common,
+
+wildcard_constraints:
+    chip="[^/]+",
+    chr="[^/]+",
+    ethnicity="[^/]+",
+    format="[^/]+",
+    mask="[^/]+",
+    method="[^/]+",
+    population="[^/]+",
+    sex="[^/]+",
+    subset="[^/]+",
+
+include: "Snakefile.king"
+include: "Snakefile.result"
+include: "Snakefile.result_hds"
+
+#---------------------------------------------------------------------------------------------------------------------------
+
+rule hds:
+    """
+    START OF PIPELINE
+    - We remove '##filedate' in the header before running HDS_UTIL as if the header is there it
+      hds-util will update it therefore creating a different checksum each time which makes testing
+      changes to this rule annoying.
+    - If TEST_REGIONS is set, we create a much smaller output file for quick iterative testing.
+    """
+    input:
+        vcf=lambda wc: join(INPUT_COMBINED[wc.chip], "{chr}.vcf.gz"),
+    output:
+        vcf=wrk("hds/{chip}/{chr}.vcf.gz"),
+    resources:
+        mem="20G",
+        runtime="21d",
+    threads:
+        2
+    benchmark:
+        mtr("hds/{chip}/{chr}.txt")
+    shell:
+        """
+        _bcftools_opts=""
+
+        if [[ -n '{TEST_REGIONS}' ]]; then
+          _bcftools_opts="--regions-file={TEST_REGIONS}"
+        fi
+
+        {{
+          {BCFTOOLS} view --no-version --header-only {input.vcf} | /bin/sed '/^##filedate/d'
+          {BCFTOOLS} view --no-version --no-header $_bcftools_opts {input.vcf}
+        }} \
+        | {BCFTOOLS} annotate --no-version --remove='INFO/AF,INFO/MAF' \
+        | {BCFTOOLS} plugin fill-tags --no-version -- --tags='INFO/AC,INFO/AF,INFO/AN,INFO/MAF' \
+        \
+        | {HDS_UTIL} --format=GT,GP,DS,HDS,SD --output-format=vcf.gz --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule filter_r2:
+    """
+    NOTE: To avoid confusion we strip r2Filter= in header since we filter w/ our own R2_VALUE.
+    """
+    input:
+        vcf=wrk("hds/{chip}/{chr}.vcf.gz"),
+    output:
+        vcf=wrk("filter_r2/{chip}/{chr}.vcf.gz"),
+    params:
+        r2=lambda wc: R2_VALUE[wc.chip],
+    resources:
+        mem="10G",
+        runtime="7d",
+    threads:
+        2
+    benchmark:
+        mtr("filter_r2/{chip}/{chr}.txt")
+    shell:
+        """
+        _header() {{ {BCFTOOLS} view --no-version --header-only {input.vcf} | /bin/egrep -v '^##r2Filter='; }}
+
+        {BCFTOOLS} reheader --header <(_header) {input.vcf} \
+          | {BCFTOOLS} view --no-version --include 'R2>{params.r2}' --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule plink:
+    """
+    We use plink option --output-chr 26 to convert X to 23, needed for compatibility with king and xwas
+
+    For wildcards.ethnicity == 'eur':
+      Keep only non-related, European controls.
+      The keep_file only contains the IID so we need to use this to create the 2-column FID/IID keep file required by plink.
+    """
+    input:
+        vcf=wrk("filter_r2/{chip}/{chr}.vcf.gz"),
+        fams_orig=FAM_ORIG.values(),
+        eur_controls=EUR_CONTROLS,
+    output:
+        pfx=wrk("plink/{chip}/{ethnicity}/{chr}"),
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("plink/{chip}/{ethnicity}/{chr}.txt")
+    shell:
+        """
+        _opts_plink=""
+
+        if [[ '{wildcards.ethnicity}' == 'eur' ]]; then
+          {BCFTOOLS} query --list-samples {input.vcf} | tr '_' '\t' > samples.tsv
+
+          set +x
+          for iid in $(tail -n +2 {input.eur_controls} | cut -f1); do
+            awk --assign iid=$iid '{{ if ($2 == iid) print $1 "\t" $2 }}' samples.tsv
+          done > eur_controls.tsv
+          set -x
+
+          _opts_plink="--keep eur_controls.tsv"
+        fi
+
+        {PLINK20} \
+          $_opts_plink \
+          --silent \
+          --vcf {input.vcf} 'dosage=HDS' \
+          --make-pgen psam-cols=fid,parents,sex,pheno1 \
+          --id-delim _ \
+          --output-chr 26 \
+          --out out
+
+        /bin/mv out.pvar {output.pfx}.pvar
+        /bin/mv out.pgen {output.pfx}.pgen
+        {PYTHON} {BASE}/scripts/update-fam.py --type=psam out.psam {input.fams_orig} > {output.pfx}.psam
+
+        /bin/touch {output.pfx}
+        """
+
+rule by_sex:
+    input:
+        pfx=wrk("plink/{chip}/{ethnicity}/{chr}")
+    output:
+        pfx=wrk("by_sex/{chip}/{ethnicity}/{sex}/{chr}")
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("by_sex/{chip}/{ethnicity}/{sex}/{chr}.txt")
+    shell:
+        """
+        case {wildcards.sex} in
+          female) _opts_plink="--keep-females" ;;
+          male)   _opts_plink="--keep-males" ;;
+          both)   _opts_plink="" ;;
+          *) exit 1 ;;
+        esac
+
+        {PLINK20} \
+          $_opts_plink \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --out out
+
+        for ext in pvar pgen psam; do
+          /bin/mv out.$ext {output.pfx}.$ext
+        done
+
+        touch {output.pfx}
+        """
+
+rule maf_geno:
+    input:
+        pfx=wrk("by_sex/{chip}/{ethnicity}/{sex}/{chr}")
+    output:
+        pfx=wrk("maf_geno/{chip}/{ethnicity}/{sex}/{chr}")
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("maf_geno/{chip}/{ethnicity}/{sex}/{chr}.txt")
+    shell:
+        """
+        _variants() {{ for f in "$@"; do grep -v '^#' "$f" | cut -f3; done | sort --version-sort | uniq; }}
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --maf 0.0005 \
+          --max-maf 0.00099 \
+          --geno 1 \
+          --nonfounders \
+          --out out.1
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --maf 0.001 \
+          --nonfounders \
+          --out out.2a
+
+        {PLINK20} \
+          --silent \
+          --pfile out.2a \
+          --make-pgen \
+          --geno 1 \
+          --nonfounders \
+          --out out.2b
+
+        _variants out.1.pvar out.2b.pvar > out.extract
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --extract out.extract \
+          --out out.3
+
+        for ext in pvar pgen psam; do
+          /bin/mv out.3.$ext {output.pfx}.$ext
+        done
+
+        /bin/touch {output.pfx}
+        """
+
+rule hwe:
+    input:
+        pfx=wrk("maf_geno/{chip}/{ethnicity}/{sex}/{chr}"),
+    output:
+        pfx=wrk("hwe/{chip}/{ethnicity}/{sex}/{chr}"),
+    shadow:
+        "shallow"
+    params:
+        hwe=lambda wildcards: HWE[wildcards.ethnicity]["common"],
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("hwe/{chip}/{ethnicity}/{sex}/{chr}.txt")
+    shell:
+        """
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --nonfounders \
+          --hwe {params.hwe} \
+          --out out
+
+        for ext in pvar pgen psam; do
+          /bin/mv out.$ext {output.pfx}.$ext
+        done
+
+        /bin/touch {output.pfx}
+        """
+
+rule hwe_hla:
+    input:
+        pfx=wrk("maf_geno/{chip}/{ethnicity}/{sex}/chr6"),
+    output:
+        pfx=wrk("hwe_hla/{chip}/{ethnicity}/{sex}/chr6"),
+    shadow:
+        "shallow"
+    params:
+        hla_start=HLA_GRCH38_START,
+        hla_end=HLA_GRCH38_END,
+        hwe_hla_pre=lambda wildcards: HWE[wildcards.ethnicity]["hla_pre"],
+        hwe_hla=lambda wildcards: HWE[wildcards.ethnicity]["hla"],
+        hwe_hla_post=lambda wildcards: HWE[wildcards.ethnicity]["hla_post"],
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("hwe_hla/{chip}/{ethnicity}/{sex}/chr6.txt")
+    shell:
+        """
+        _variants() {{ for f in "$@"; do grep -v '^#' "$f" | cut -f3; done | sort --version-sort | uniq; }}
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --nonfounders \
+          --chr 6 \
+          --to-bp {params.hla_start} \
+          --hwe {params.hwe_hla_pre} \
+          --out out.hla_pre
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --nonfounders \
+          --chr 6 \
+          --from-bp {params.hla_start} \
+          --to-bp {params.hla_end} \
+          --hwe {params.hwe_hla} \
+          --out out.hla
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --nonfounders \
+          --chr 6 \
+          --from-bp {params.hla_end} \
+          --hwe {params.hwe_hla_post} \
+          --out out.hla_post
+
+        _variants out.hla_pre.pvar out.hla.pvar out.hla_post.pvar > out.extract
+
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --extract out.extract \
+          --out out
+
+        for ext in pvar pgen psam; do
+          /bin/mv out.$ext {output.pfx}.$ext
+        done
+
+        /bin/touch {output.pfx}
+        """
+
+rule hwe_sex:
+    """
+    How to Include Chromosome X in Your Genome‐Wide
+      https://onlinelibrary.wiley.com/doi/full/10.1002/gepi.21782
+    """
+    input:
+        pfx=wrk("maf_geno/{chip}/{ethnicity}/{sex}/chrX"),
+    output:
+        pfx=wrk("hwe_sex/{chip}/{ethnicity}/{sex}/chrX"),
+    params:
+        hwe=lambda wc: HWE[wc.ethnicity]["sex"],
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        4
+    benchmark:
+        mtr("hwe_sex/{chip}/{ethnicity}/{sex}/chrX.txt")
+    shell:
+        """
+        {PLINK20} \
+          --silent \
+          --pfile {input.pfx} \
+          --make-pgen \
+          --nonfounders \
+          --chr 23 \
+          --hwe {params.hwe} \
+          --out out
+
+        for ext in pvar pgen psam; do
+          /bin/mv out.$ext {output.pfx}.$ext
+        done
+
+        /bin/touch {output.pfx}
+        """
+
+def inp_keep_pfx(wc):
+    if wc.chr == "chr6": input_dir = "hwe_hla"
+    elif wc.chr == "chrX": input_dir = "hwe_sex"
+    else: input_dir = "hwe"
+
+    return wrk(input_dir, wc.chip, "eur", wc.sex, wc.chr)
+
+rule keep:
+    input:
+        pfx=inp_keep_pfx,
+    output:
+        txt=wrk("keep/{chip}/{sex}/{chr}.txt"),
+    resources:
+        mem="5G",
+        runtime="1h",
+    threads:
+        1
+    shell:
+        """
+        grep -v '^#' {input.pfx}.pvar | cut -f3 | sort | uniq > {output.txt}
+        """
+
+rule filter_keep:
+    """
+    For chrX, filter the filter_r2 input because it occurs earlier in the pipeline before we split into separate female/male files.
+    """
+    input:
+        pfx=wrk("by_sex/{chip}/all/{sex}/{chr}"),
+        txt=wrk("keep", QC_CHIP, "{sex}/{chr}.txt"),
+        vcf=wrk("filter_r2/{chip}/{chr}.vcf.gz"),
+    output:
+        vcf=wrk("filter_keep/{chip}/{sex}/{chr}.vcf.gz"),
+    resources:
+        mem="20G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("filter_keep/{chip}/{sex}/{chr}.txt")
+    shell:
+        """
+        if [[ "{wildcards.sex}" == "female" || "{wildcards.sex}" = "male" ]]; then
+            tail -n+2 {input.pfx}.psam | cut -f1,2 | tr '\t' '_' > {output.vcf}.samples.txt
+            _bcftools_opts="--samples-file {output.vcf}.samples.txt"
+        else
+            _bcftools_opts=""
+        fi
+
+        {BCFTOOLS} view \
+          $_bcftools_opts \
+          --no-version \
+          --include ID==@{input.txt} \
+          --output={output.vcf} \
+          {input.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule combine:
+    input:
+        vcfs=expand(wrk("filter_keep/{chip}/{{sex}}/{{chr}}.vcf.gz"), chip=CHIPS),
+    output:
+        vcf=wrk("combine/{sex}/{chr}.vcf.gz"),
+    resources:
+        mem="20G",
+        runtime="7d",
+    threads:
+        2
+    benchmark:
+        mtr("combine/{sex}/{chr}.txt")
+    shell:
+        """
+        {BCFTOOLS} merge --no-version --merge=none --output-type=u {input.vcfs} \
+          | {BCFTOOLS} view --no-version --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule combine_plink:
+    input:
+        vcf=wrk("combine/{sex}/{chr}.vcf.gz"),
+        fams_orig=FAM_ORIG.values(),
+    output:
+        pfx=wrk("combine_plink/{sex}/{chr}"),
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="4h",
+    threads:
+        2
+    benchmark:
+        mtr("combine_plink/{sex}/{chr}.txt")
+    shell:
+        """
+        {PLINK20} \
+          --silent \
+          --vcf {input.vcf} 'dosage=HDS' \
+          --id-delim _ \
+          --make-bed \
+          --output-chr 26 \
+          --out out
+
+        /bin/mv out.bed {output.pfx}.bed
+        /bin/mv out.bim {output.pfx}.bim
+        {PYTHON} {BASE}/scripts/update-fam.py --type=fam out.fam {input.fams_orig} > {output.pfx}.fam
+
+        /bin/touch {output.pfx}
+        """
+
+rule mendel:
+    """
+    Filter SNPs using mendelian error checking in plink. We use wildcards {me} which is fed to the plink command "--me"
+    (Filter out trios and variants with high Mendel error rates) to allow us to experiment with different thresholds.
+
+    NOTE: For the downstream rule we use the single value set in ME_THRESHOLD.
+
+    We also determined that we want to exclude immunochip from the mendelian error analysis so we exclude all
+    immunochip samples at the beginning of this rule using the hds_util/immun rule to filter immun subjects (n=5983) out.
+    """
+    input:
+        pfx=wrk("combine_plink/{sex}/{chr}"),
+        vcf=wrk("filter_r2/immun/{chr}.vcf.gz"),
+    output:
+        pfx=wrk("mendel/{me}/{sex}/{chr}"),
+    shadow:
+        "shallow"
+    resources:
+        mem="60G",
+        runtime="1d",
+    threads:
+        2
+    shell:
+        """
+        {BCFTOOLS} query --list-samples {input.vcf} | tr '_' ' ' > immun_subjects.txt
+
+        {PLINK19} --silent --make-bed --bfile {input.pfx} --remove immun_subjects.txt --out no_immun
+
+        # Run statistics
+
+        {PLINK19} --silent --bfile no_immun --mendel --out out.mendel
+        {PLINK19} --silent --bfile no_immun --mendel --mendel-duos --out out.mendel.mendel_duos
+
+        # Peform filtering
+
+        {PLINK19} --silent --make-bed --bfile no_immun --me 1 {wildcards.me} 'var-first' --mendel-duos --set-me-missing \
+                  --out out.filter.1
+
+        {PLINK19} --silent --make-bed --bfile out.filter.1 --set-hh-missing --out out.filter.2
+
+        {PLINK19} --silent --make-bed --bfile out.filter.2 --geno 1 --out out.filter.3
+
+        for ext in bed bim fam; do
+          /bin/cp out.filter.3.$ext {output.pfx}.$ext
+        done
+
+        /bin/touch {output.pfx}
+        """
+
+def inp_mendel_keep(wc):
+    if wc.chr == "chrX":
+        sexes = ["male", "female"]
+    else:
+        sexes = ["both"]
+
+    return [wrk("mendel", wc.me, sex, wc.chr) for sex in sexes]
+
+rule mendel_keep:
+    """
+    Create keep list from mendel analysis - for chrX we perform a union of male/female SNPs that passed
+    """
+    input:
+        pfxs=inp_mendel_keep,
+    output:
+        txt=wrk("mendel_keep/{me}/{chr}.keep.txt"),
+    resources:
+        mem="10G",
+        runtime="4h",
+    threads:
+        1
+    shell:
+        """
+        for pfx in {input.pfxs}; do
+          /bin/cut -f2 $pfx.bim
+        done | sort --version-sort | uniq > {output.txt}
+        """
+
+rule filter_mendel_keep:
+    """
+    Filter only SNP Ids that passed the mendel step and then use bcftools annotate re-write the snp ids to . so SNPSift annotation
+    will replace them completely instead of appending ";<rsid>
+    """
+    input:
+        txt=wrk("mendel_keep", ME_THRESHOLD, "{chr}.keep.txt"),
+        vcf=wrk("combine/{sex}/{chr}.vcf.gz"),
+    output:
+        vcf=wrk("filter_mendel_keep/{sex}/{chr}.vcf.gz"),
+    resources:
+        mem="20G",
+        runtime="7d",
+    threads:
+        2
+    benchmark:
+        mtr("filter_mendel_keep/{sex}/{chr}.txt")
+    shell:
+        """
+        {BCFTOOLS} view --no-version --include ID==@{input.txt} --output-type=u {input.vcf} \
+          | {BCFTOOLS} annotate --no-version --set-id . --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+def inp_join_sex(wc):
+    if wc.chr == "chrX":
+        sexes = ["female", "male"]
+    else:
+        sexes = ["both"]
+
+    return [wrk("filter_mendel_keep", sex, wc.chr + ".vcf.gz") for sex in sexes]
+
+rule join_sex:
+    """
+    We merge male/female files for chrX but just symlink all others for pass-through.
+    """
+    input:
+        vcfs=inp_join_sex,
+    output:
+        vcf=wrk("join_sex/{chr}.vcf.gz"),
+    resources:
+        mem="10G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("join_sex/{chr}.txt")
+    shell:
+        """
+        if [[ '{wildcards.chr}' == 'chrX' ]]; then
+          {BCFTOOLS} merge --no-version --merge=none --output-type=u {input.vcfs} \
+            | {BCFTOOLS} view --no-version --output={output.vcf}
+
+          {BCFTOOLS} index --tbi {output.vcf}
+
+          for f in {output.vcf} {output.vcf}.tbi; do
+            /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+          done
+        else
+          for ext in "" .md5 .tbi .tbi.md5; do
+            /bin/ln -s {input.vcfs[0]}$ext {output.vcf}$ext
+          done
+        fi
+        """
+
+rule dbsnp_remap_refseq:
+    input:
+        dbsnp=DBSNP_VCF_GRCH38,
+        refseq_map=DBSNP_VCF_MAP_GRCH38
+    output:
+        vcf=wrk("dbsnp_remap_refseq/grch38/dbsnp.vcf.gz")
+    resources:
+        mem="20G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("dbsnp_remap_refseq.txt")
+    shell:
+        """
+        zcat {input.dbsnp} \
+          | {PYTHON} {BASE}/scripts/remap_dbsnp_vcf.py {input.refseq_map} \
+          | {BGZIP} > {output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule cc_samples:
+    input:
+        wgs_bcf=join(WGS_VCF_DIR, "merged.{chr}.gtonly.minDP10.filtered.passonly.w500000.ligated.bcf"),
+        gwas_bcf=wrk("snpsift_annotate/gwas/{chr}.vcf.gz")
+    output:
+        wgs_samples=wrk("cc_samples/wgs/{chr}.txt"),
+        gwas_samples=wrk("cc_samples/gwas/{chr}.txt")
+    resources:
+        mem="10G",
+        runtime="1h",
+    threads:
+        1
+    shell:
+        """
+        {BCFTOOLS} query --list-samples {input.wgs_bcf} > {output.wgs_samples}
+        {BCFTOOLS} query --list-samples {input.gwas_bcf} > {output.gwas_samples}
+        """
+
+rule cc_samples_common:
+    """
+    Find the samples common between WGS and GWAS samples then generate mapping files with their specific sample name format
+    to a common sample name format.
+    """
+    input:
+        wgs_samples=wrk("cc_samples/wgs/{chr}.txt"),
+        gwas_samples=wrk("cc_samples/gwas/{chr}.txt")
+    output:
+        wgs_map=wrk("cc_samples_common/wgs/{chr}.tsv"),
+        gwas_map=wrk("cc_samples_common/gwas/{chr}.tsv")
+    resources:
+        mem="10G",
+        runtime="1h",
+    threads:
+        1
+    run:
+        db_wgs = {}
+        db_gwas = {}
+
+        with open(input.wgs_samples) as f:
+            for line in f:
+                iid, phase = line.rstrip("\n").split("_")
+                if iid in db_wgs:
+                    if phase == "P2":
+                        db_wgs[iid] = iid + "_" + phase
+                else:
+                    db_wgs[iid] = iid + "_" + phase
+
+        with open(input.gwas_samples) as f:
+            for line in f:
+                fid, iid = line.rstrip("\n").split("_")
+                if iid in db_gwas:
+                    print(f"Error {iid} duplicate in db_gwas. Exiting.", file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    db_gwas[iid] = fid + "_" + iid
+
+        samples_common = set(db_wgs).intersection(db_gwas)
+
+        with open(output.wgs_map, "w") as f_out:
+            for sample in samples_common:
+                print(" ".join([db_wgs[sample], sample]), file=f_out)
+
+        with open(output.gwas_map, "w") as f_out:
+            for sample in samples_common:
+                print(" ".join([db_gwas[sample], sample]), file=f_out)
+
+def inp_cc_samples_rename(wildcards):
+    if wildcards.method == "gwas":
+        return wrk("snpsift_annotate", "gwas", wildcards.chr + ".vcf.gz")
+
+    elif wildcards.method == "wgs":
+        return join(WGS_VCF_DIR, "merged." + wildcards.chr + ".gtonly.minDP10.filtered.passonly.w500000.ligated.bcf")
+
+    else:
+        sys.exit(1)
+
+rule cc_samples_rename:
+    """
+    Filter common samples between WGS and GWAS and rename to the commmon sample name format.
+    """
+    input:
+        vcf=inp_cc_samples_rename,
+        map=wrk("cc_samples_common/{method}/{chr}.tsv")
+    output:
+        vcf=wrk("cc_samples_rename/{method}/{chr}.vcf.gz")
+    resources:
+        mem="10G",
+        runtime="1d",
+    threads:
+        1
+    benchmark:
+        mtr("cc_samples_rename/{method}/{chr}.txt")
+    shell:
+        """
+        {BCFTOOLS} view --no-version --samples-file=<(cut -d' ' -f1 {input.map}) --output-type=u {input.vcf} \
+          | {BCFTOOLS} reheader --samples={input.map} \
+          | {BCFTOOLS} view --no-version --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+def inp_snpsift_annotate(wc):
+    if wc.method == "gwas":
+        return wrk("join_sex", wc.chr + ".vcf.gz")
+
+    elif wc.method == "wgs":
+        return wrk("cc_samples_rename", "wgs", wc.chr + ".vcf.gz")
+    else:
+        sys.exit(1)
+
+rule snpsift_annotate:
+    """
+    Annotate SNPs with SnpSift (https://pcingola.github.io/SnpEff/).
+    - Before SnpSift
+      - Zero out all SNPs to "." (SnpSift annotates missing SNPs to weird notation otherwise)
+      - Index the vcf.gz using tabix format (--tbi)
+    - After SnpSift
+      - Rewrite any missing SNPs (".") to the synthetic id <chr>:<pos>:<ref>:<alt>
+
+    Note: {method} wildcard is either gwas or wgs.
+    """
+    input:
+        vcf=inp_snpsift_annotate,
+        dbsnp_vcf_gz=wrk("dbsnp_remap_refseq/grch38/dbsnp.vcf.gz"),
+    output:
+        vcf=wrk("snpsift_annotate/{method}/{chr}.vcf.gz"),
+    resources:
+        mem="30G",
+        runtime="3d",
+    threads:
+        4
+    benchmark:
+        mtr("snpsift_annotate/{method}/{chr}.txt")
+    shadow:
+        "shallow"
+    shell:
+        """
+        {BCFTOOLS} annotate --no-version --set-id . --output=out.vcf.gz {input.vcf}
+        {BCFTOOLS} index --tbi out.vcf.gz
+
+        {SNPSIFT} annotate -id {input.dbsnp_vcf_gz} out.vcf.gz \
+          | {BCFTOOLS} annotate --no-version --set-id +'%CHROM:%POS:%REF:%ALT' --output={output.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+rule cc_snpsift_concordance:
+    """
+    See: <https://pcingola.github.io/SnpEff/ss_concordance/>
+    NOTE: For WGS the extra contigs cause an issue w/ SnpSift so remove these and just leave the
+          single chromosome config.
+    """
+    input:
+        vcf_wgs=wrk("snpsift_annotate/wgs/{chr}.vcf.gz"),
+        vcf_gwas=wrk("cc_samples_rename/gwas/{chr}.vcf.gz")
+    output:
+        tsv=wrk("cc_snpsift_concordance/{chr}.tsv")
+    shadow:
+        "shallow"
+    params:
+        java_opts="-Xmx25g"
+    resources:
+        mem="30G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_snpsift_concordance/{chr}.txt")
+    shell:
+        """
+        {{
+          {BCFTOOLS} view --no-version --header-only {input.vcf_wgs} \
+            | sed "s/^##contig.*/##contig=<ID={wildcards.chr}>/" \
+            | uniq
+
+          {BCFTOOLS} view --no-header {input.vcf_wgs}
+        }} \
+        > out.wgs.vcf
+
+        {BCFTOOLS} view --no-version --output=out.gwas.vcf {input.vcf_gwas}
+
+        JAVA_OPTS="{params.java_opts}" \
+          {SNPSIFT} concordance -v \
+          out.wgs.vcf \
+          out.gwas.vcf \
+          > {output.tsv}
+        """
+
+rule cc_snpsift_exclude:
+    """
+    Generate a list of variants which pass a snpsift wgs/gwas concordance threshold.
+    """
+    input:
+        tsv=wrk("cc_snpsift_concordance/{chr}.tsv"),
+        vcf_gwas=wrk("cc_samples_rename/gwas/{chr}.vcf.gz"),
+    output:
+        txt=wrk("cc_snpsift_exclude/{chr}.txt"),
+    params:
+        concordance_threshold=CONCORDANCE_THRESHOLD
+    resources:
+        mem="30G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_snpsift_exclude/{chr}.txt")
+    shell:
+        """
+        _vcf_gwas() {{
+          {BCFTOOLS} view --no-version --no-header {input.vcf_gwas}
+        }}
+
+        {PYTHON} {BASE}/scripts/cc_snpsift_exclude.py \
+          {input.tsv} \
+          <(_vcf_gwas) \
+          {params.concordance_threshold} \
+          | sort --version-sort \
+          | uniq \
+          > {output.txt}
+
+        /bin/wc -l {output.txt}
+        """
+
+rule cc_snpsift_exclude_hla:
+    """
+    This rule is an exploration to find the best concordance threshold for the HLA region of chr6.
+    We extract the HLA region from chr6 into a VCF and then perform different thresholds via {wildcards.threshold}.
+    """
+    input:
+        tsv=wrk("cc_snpsift_concordance/chr6.tsv"),
+        vcf=wrk("cc_samples_rename/gwas/chr6.vcf.gz")
+    output:
+        tsv=wrk("cc_snpsift_exclude_hla/{threshold}.tsv"),
+        vcf=wrk("cc_snpsift_exclude_hla/{threshold}.vcf"),
+        txt=wrk("cc_snpsift_exclude_hla/{threshold}.txt")
+    params:
+        hla_start=HLA_GRCH38_START,
+        hla_end=HLA_GRCH38_END,
+    resources:
+        mem="30G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_snpsift_exclude_hla/{threshold}.txt")
+    shell:
+        """
+        head -1 {input.tsv} > {output.tsv}
+
+        awk -v hla_start={params.hla_start} -v hla_end={params.hla_end} \
+          '{{ if (($2 >= hla_start) && ($2 <= hla_end)) print }}' {input.tsv} \
+          >> {output.tsv}
+
+        {BCFTOOLS} view --no-version --output={output.vcf} {input.vcf} chr6:{params.hla_start}-{params.hla_end}
+
+        {PYTHON} {BASE}/scripts/cc_snpsift_exclude.py {output.tsv} {output.vcf} {wildcards.threshold} \
+          | sort --version-sort | uniq > {output.txt}
+
+        /bin/wc -l {output.txt}
+        """
+
+rule cc_filter_ruth_pca:
+    input:
+        samples=wrk("cc_filter_ruth_samples/{subset}/{sex}/{chr}.txt"),
+        mask_db=MASK_DB,
+        pca_immun=PCA_IMMUN,
+        pca_exome=PCA_EXOME,
+    output:
+        tsv=wrk("cc_filter_ruth_pca/{subset}/{sex}/{chr}.tsv"),
+    resources:
+        mem="20G",
+        runtime="4h",
+    threads:
+        1
+    shell:
+        """
+        {PYTHON} {BASE}/scripts/merge_mask_pca_files.py \
+          {input.mask_db} \
+          {input.pca_immun} \
+          {input.pca_exome} \
+          {input.samples} \
+        > {output.tsv}
+        """
+
+def inp_cc_filter_ruth_samples(wc):
+    if wc.chr == "chrX" and wc.sex == "both":
+        return wrk("join_sex/chr22.vcf.gz")
+    else:
+        return wrk("filter_mendel_keep", wc.sex, wc.chr + ".vcf.gz")
+
+rule cc_filter_ruth_samples:
+    """
+    - We choose merge_chip_filter_mendel_keep because this the last step before we merge chrX female/male back together which was
+      required for mendelian error set of rules.
+
+    - The command `comm -12` outputs the list of lines appearing in both files (intersection)
+    """
+    input:
+        vcf=inp_cc_filter_ruth_samples,
+        mask_db=MASK_DB,
+        pca_immun_fam=PCA_IMMUN_FAM,
+        pca_exome_fam=PCA_EXOME_FAM,
+    output:
+        samples=wrk("cc_filter_ruth_samples/{subset}/{sex}/{chr}.txt")
+    resources:
+        mem="10G",
+        runtime="1h",
+    threads:
+        1
+    shell:
+        """
+        _control_samples() {{
+          {PYTHON} {BASE}/scripts/control_samples.py \
+            {input.mask_db} \
+            {input.pca_immun_fam} \
+            {input.pca_exome_fam} \
+            | sort \
+            | uniq
+        }}
+
+        case {wildcards.subset} in
+          all)
+            {BCFTOOLS} query --list-samples {input.vcf} | sort > {output.samples}
+            ;;
+          controls)
+            comm -12 \
+              <({BCFTOOLS} query --list-samples {input.vcf} | sort) \
+              <(_control_samples)
+            ;;
+          *)
+            exit 1
+            ;;
+        esac \
+        | sort > {output.samples}
+        """
+
+rule cc_filter:
+    input:
+        samples=wrk("cc_filter_ruth_samples/{subset}/{sex}/{chr}.txt"),
+        vcf=wrk("snpsift_annotate/gwas/{chr}.vcf.gz"),
+        exclude_snps_txt=wrk("cc_snpsift_exclude/{chr}.txt")
+    output:
+        vcf=wrk("cc_filter/{subset}/{sex}/{chr}.vcf.gz")
+    resources:
+        mem="20G",
+        runtime="1d",
+    threads:
+        2
+    shell:
+        """
+        {BCFTOOLS} view \
+          --no-version \
+          --samples-file={input.samples} \
+          --exclude ID==@{input.exclude_snps_txt} \
+          --output={output.vcf} \
+          {input.vcf}
+
+        {BCFTOOLS} index --tbi {output.vcf}
+
+        for f in {output.vcf} {output.vcf}.tbi; do
+          /bin/md5sum $f | cut -d' ' -f1 > $f.md5
+        done
+        """
+
+#------------------------------------------------------------------------------------------------------
+# Ruth - Robust Unified Hardy-Weinberg Equilibrium Test (https://github.com/statgen/ruth)
+#------------------------------------------------------------------------------------------------------
+
+def params_cc_filter_ruth_snps(wc):
+    if wc.chr == "chr6":
+        return " ".join([
+            "10,chr6:0-28510120",
+            "20,chr6:28510121-33480577",
+            "10,chr6:33480578-"])
+    elif wc.chr == "chrX":
+        return "4,"
+    else:
+        return "10,"
+
+rule cc_filter_ruth_snps:
+    """
+    Generate a list of SNPs to exclude. Downstream we only use the 'controls' wildcard output as the
+    filter list to apply to the full cc_filter/all but we generate an 'all' wildcard version for comparison
+    purposes only.
+
+    The statistic of interest is HWE_SLP_I, which is the signed log10 P-value of the HWE test with individual-specific
+    allele frequencies, adjusted for population structure:
+    - HWE_SLP_I < 0 indicates an excess of heterozygotes
+    - HWE_SLP_I > 0 indicates heterozygote depletion
+
+    An excess of heterozygotes can be a telltale sign of certain types of technical artefacts
+    """
+    input:
+        pca_tsv=wrk("cc_filter_ruth_pca/{subset}/{sex}/{chr}.tsv"),
+        vcf=wrk("cc_filter/{subset}/{sex}/{chr}.vcf.gz")
+    output:
+        snps_exclude=wrk("cc_filter_ruth_snps/{subset}/{sex}/{chr}.txt")
+    params:
+        filters=params_cc_filter_ruth_snps
+    shadow:
+        "shallow"
+    resources:
+        mem="30G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_filter_ruth_snps/{subset}/{sex}/{chr}.txt")
+    shell:
+        """
+        if [[ '{wildcards.chr}' == 'chrX' ]]; then _ruth_opts='--x-label chrX'; else _ruth_opts=''; fi
+
+        {RUTH} \
+          --vcf {input.vcf} \
+          --evec {input.pca_tsv} \
+          --field GT \
+          --lambda 0 \
+          --lrt-em \
+          $_ruth_opts \
+          --out ruth.vcf
+
+        {BCFTOOLS} view --output=ruth.bcf ruth.vcf
+
+        {BCFTOOLS} index ruth.bcf
+
+        for _filter in {params.filters}; do
+            _hwe_slp_i_max=$(echo $_filter | cut -d, -f1)
+            _range=$(echo $_filter | cut -d, -f2)
+
+            {BCFTOOLS} view ruth.bcf $_range \
+              | {BCFTOOLS} query --include="HWE_SLP_I > $_hwe_slp_i_max" --format='%ID\t%POS\t%REF\t%ALT\n'
+
+        done | sort --version-sort > {output.snps_exclude}.full
+
+        cut -f1 {output.snps_exclude}.full | sort --version-sort | uniq > {output.snps_exclude}
+        """
+
+def inp_cc_filter_ruth_snps_exclude(wc):
+    if wc.chr == "chrX":
+        sex = "female"
+    else:
+        sex = "both"
+
+    return wrk("cc_filter_ruth_snps/controls", sex, wc.chr + ".txt")
+
+rule cc_filter_ruth:
+    """
+    We only use the subset=all as the input file and the subset=controls for the SNPs to exclude.
+    Also for chrX we only use the SNPs identified to exclude from the female separated file.
+    """
+    input:
+        vcf=wrk("cc_filter/all/both/{chr}.vcf.gz"),
+        snps_exclude=inp_cc_filter_ruth_snps_exclude
+    output:
+        vcf=wrk("cc_filter_ruth/{chr}.bcf")
+    resources:
+        mem="20G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_filter_ruth/{chr}.txt")
+    shell:
+        """
+        {BCFTOOLS} view --no-version --exclude ID==@{input.snps_exclude} --output={output.vcf} {input.vcf}
+
+        {BCFTOOLS} index {output.vcf}
+        """
+
+rule cc_filter_ruth_post_filter:
+    """
+    Suna suggested removing SNPs with MAF < 0.01 AND R2 < 0.80 so we apply this post filtering of SNPs.
+    We use the subset of the european control subjects for the filtering purposes.
+    We also must use bcftools plugin fill-tags to update the AN,AC,AF,MAF fields.
+    """
+    input:
+        eur_controls_tsv=EUR_CONTROLS,
+        vcf=wrk("cc_filter_ruth/{chr}.bcf")
+    output:
+        samples_all=wrk("cc_filter_ruth_post_filter/{chr}.samples_all.txt"),
+        samples_eur=wrk("cc_filter_ruth_post_filter/{chr}.samples_eur.txt"),
+        snps_exclude=wrk("cc_filter_ruth_post_filter/{chr}.snps_exclude.txt"),
+        vcf=wrk("cc_filter_ruth_post_filter/{chr}.bcf")
+    params:
+        bcftools_query_filter="MAF < 0.01 && R2 < 0.80"
+    resources:
+        mem="20G",
+        runtime="1d",
+    threads:
+        2
+    benchmark:
+        mtr("cc_filter_ruth_post_filter/{chr}.txt")
+    shell:
+        """
+        {BCFTOOLS} query --list-samples {input.vcf} | tr '_' '\t' > {output.samples_all}
+
+        for iid in $(tail -n +2 {input.eur_controls_tsv} | cut -f1); do
+          awk --assign iid=$iid '{{ if ($2 == iid) print $1 "_" $2 }}' {output.samples_all}
+        done > {output.samples_eur}
+
+        {BCFTOOLS} view --no-version --output-type=u --samples-file={output.samples_eur} {input.vcf} \
+          | {BCFTOOLS} plugin fill-tags --output-type=u -- --tags=AN,AC,AF,MAF \
+          | {BCFTOOLS} query --include='{params.bcftools_query_filter}' --format='%ID\n' \
+          | sort | uniq > {output.snps_exclude}
+
+        {BCFTOOLS} view \
+          --no-version \
+          --exclude ID==@{output.snps_exclude} \
+          --output={output.vcf} \
+          {input.vcf}
+
+        {BCFTOOLS} index {output.vcf}
+        """
+
+# vim: filetype=snakemake tabstop=4 shiftwidth=4 softtabstop=4 expandtab
+</pre>
+</body>
+</html>
